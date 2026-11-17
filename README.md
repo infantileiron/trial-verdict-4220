@@ -12,12 +12,13 @@
 2. **事件核对**：曝光/激活，按实验+用户+类型去重，禁止同用户跨组、未来事件、超观察期及先激活后曝光。
 3. **实验裁决**：Redis队列由Python worker真算比例z检验、SRM卡方、绝对提升及95%区间，保留协议与全部输入快照。
 4. **发布记录**：分析员填写业务理由，管理员签核上线B或保留A。未到期、SRM异常、小样本禁止发布；上线B还需正向显著提升。已发布裁决不可覆盖。
+5. **事件归档**：按实验把在线原始事件迁入不可变归档文件；回读核验数量、分组与SHA256后才释放在线明细。批次状态为排队/迁移/完成/失败，失败保留原件并可原地重试。
 
 | 角色 | 页面 | 权限与动作 |
 |---|---|---|
-| admin | 全部、审计API | 编辑业务、执行检验、签核发布 |
-| analyst | 四业务页 | 录入事件、建实验、提交检验、起草理由；不能发布 |
-| viewer | 四业务页 | 只读、下载已有证据；服务端阻止一切写入/计算 |
+| admin | 全部、审计API | 编辑业务、执行检验、签核发布、发起/重试归档 |
+| analyst | 五业务页 | 录入事件、建实验、提交检验、起草理由、发起/重试归档；不能发布 |
+| viewer | 五业务页 | 只读、下载已有证据；服务端阻止一切写入/计算/归档 |
 
 演示账号 `admin@demo.local` / `analyst@demo.local` / `viewer@demo.local`，密码均为 `Demo123!`。JWT有效8小时，生产应更换JWT_SECRET与数据库密码。
 
@@ -32,6 +33,15 @@
 - 置信区间以百分点展示。p值后台保留完整精度，前端小值科学计数。相对提升只在pA>0时提供。结果有SHA256校验和与算法版本`two-proportion-srm-1.0`。
 - 发布时重新检查冻结协议的结束时间与原快照门禁，后加样本不会改变旧结果。新数据须新建裁决。观察期按UTC存储、界面按上海时区展示，不使用反复偷看校正/多重检验，业务负责人应使用预先定义的单次检验。
 
+## 事件归档口径
+
+- 归档是**原始事件的权威副本**：批次创建时在实验行锁内冻结在线水位线与确切事件 ID，写入 `ARCHIVE_DIR`（默认 `/artifacts/archive`）下的批次 JSON，临时文件+rename 原子替换。
+- 回读核验 SHA256、事件总数、A/B×曝光/激活分组计数、用户+类型重复、实验归属；全部通过才在**同一事务**内释放该批在线明细并置为完成，崩溃或失败自动回滚，在线原件完整保留。
+- 失败批次说明差异（文件缺失/校验和不符/数量变化/释放数量异常），保留在线原件，可在页面「恢复重试」原地重新冻结并重跑；同一实验同时只允许一个进行中批次，且存在失败批次时必须先重试，避免重复归档。
+- 迁移期间采集与裁决并发可用：事件查询与裁决合并「在线未归档 + 已核验归档」。迟到激活仍能匹配已归档曝光；跨组、重复（同实验/用户/类型）校验跨在线与归档生效。采集与归档迁移都锁定实验行，避免核验后释放与新增事件交错导致漏计或双计。
+- 裁决冻结完整样本（快照记录在线/归档来源条数）。任一归档不可读时**拒绝计算**并返回差异说明，绝不静默缩小样本；已冻结裁决与已发布记录不受后续归档影响。
+- 页面「事件归档」可发起归档、查看排队/迁移/完成/失败进度、在线与归档人数及失败原因。观察员只读，发起/重试需要 analyst/admin。
+
 ## seed与一天剧本
 
 固定自然键：成熟实验 `LJ-1115-A`，1200名用户各600人/组，A激活120人、B激活180人；1500条曝光/激活事件。`LJ-1115-B`为尚未到期实验。时间相对首次seed当日生成，已存在协议、事件、用户不覆盖。重复seed不会增加重复记录，也不覆盖修改。
@@ -44,6 +54,9 @@
 6. 09:40 对照区间和样本量，填写上线收益、成本与采集核对依据。
 7. 10:00 admin签核上线B；未到期或分流异常实验会被409阻断。
 8. 10:10 viewer下载 `trial-verdict-<id>.json`，产品负责人留存。发布记录只在本项目落库，不调用外部发布服务。
+9. 10:20 analyst在「事件归档」对 `LJ-1115-A` 发起归档，观察排队→迁移→完成；页面显示在线0人 / 归档1200人。
+10. 10:30 录入 `LJ-U0200` 的迟到激活（该用户曝光已在归档中），校验通过；对 `LJ-U0001` 再录曝光返回409。
+11. 10:40 再提交一次裁决：快照显示在线+归档合并的1501条事件，比例与旧裁决一致；旧裁决与发布记录不变。
 
 ## 快速启动
 
@@ -63,19 +76,21 @@ docker compose exec -T backend python -m scripts.seed_demo
 |---|---|
 | 前端 | 原生HTML/CSS/ES modules、Nginx，Google Fonts Noto Sans SC + ZCOOL XiaoWei |
 | 后端 | Python 3.11 / FastAPI / SQLAlchemy / PyJWT / SciPy |
-| 任务 | Redis持久队列 + 独立Python worker，启动回收queued/running任务 |
-| 存储 | MySQL8.0，实验/事件/裁决/用户/审计；数据库、Redis、产物三命名卷 |
+| 任务 | Redis持久队列 + 独立Python worker（裁决与归档两队列，启动回收queued/running/migrating任务） |
+| 存储 | MySQL8.0，实验/事件/裁决/归档批次/用户/审计；数据库、Redis、产物三命名卷 |
 
 `frontend/src` 按api/stores/types/components/hooks/pages/router/utils/constants拆分；`backend/src` 按routes/controllers/services/models/schemas/middlewares/utils/constants/config拆分；`backend/scripts/seed_demo.py`；`backend/migrations`记录初始元数据约束。schema由SQLAlchemy metadata初始化。所有计算/校验/持久化均在Python。
 
-共享枚举：后端 `backend/src/constants/enums.py`，前端 `frontend/src/constants/enums.js`，含角色admin/analyst/viewer、组别A/B、事件exposure/activation、任务queued/running/done/failed、裁决publish_b/keep_a；schema的Literal校验和页面选择器使用同组值。
+共享枚举：后端 `backend/src/constants/enums.py`，前端 `frontend/src/constants/enums.js`，含角色admin/analyst/viewer、组别A/B、事件exposure/activation、任务queued/running/done/failed、归档queued/migrating/done/failed、裁决publish_b/keep_a；schema的Literal校验和页面选择器使用同组值。
 
-本地开发：后端安装 `backend/requirements.lock`（完整固定版本），设置DATABASE_URL、REDIS_URL、JWT_SECRET后在backend运行`uvicorn src.main:app --reload --port 8000`；另开`python -m src.worker`。前端可用本项目Nginx容器代理该后端，所有请求统一`/api/`剥前缀。常用API为 `/auth/login`、`/experiments`、`/events`、`/decisions`、`/decisions/{id}/rationale`、`/decisions/{id}/publish`、`/decisions/{id}/export`。
+归档 API：`GET/POST /archives`、`GET /archives/{id}`、`POST /archives/{id}/retry`、`GET /archives/{id}/verify`；`GET /events` 默认合并在线与归档并标注来源。
+
+本地开发：后端安装 `backend/requirements.lock`（完整固定版本），设置DATABASE_URL、REDIS_URL、JWT_SECRET后在backend运行`uvicorn src.main:app --reload --port 8000`；另开`python -m src.worker`。前端可用本项目Nginx容器代理该后端，所有请求统一`/api/`剥前缀。常用API为 `/auth/login`、`/experiments`、`/events`、`/decisions`、`/decisions/{id}/rationale`、`/decisions/{id}/publish`、`/decisions/{id}/export`、`/archives`。
 
 环境变量见`.env.example`：COMPOSE_PROJECT_NAME、三宿主端口、DB_PASSWORD、JWT_SECRET、SEED_DEMO、NETWORK_SUBNET；内部DATABASE_URL与REDIS_URL由Compose设置。默认显式子网10.253.104.0/24用于避开本机地址池耗尽，迁移时可修改。5服务都有健康检查，MySQL通过TCP SELECT1验证应用用户，worker用20秒心跳；后端健康检查同时查数据库和Redis。审计记录操作者/动作/UTC时间；请求ID、安全响应头与全局错误恢复构成横切处理。
 
 ## 已知差异
 
-小型范围提供逐条事件录入与API，不含CSV批量导入、自动随机分流、外部产品埋点、通知和真实上线控制；事件列表最多显示最近80条但计算使用全部记录。实验协议修订只提供API且仅限无事件时。原始事件采用追加留痕，不提供覆盖删除。前端字体网络不可用时退回字体类别。这里的显著结果仅是固定样本的大样本近似，不替代业务成本审查。
+小型范围提供逐条事件录入与API，不含CSV批量导入、自动随机分流、外部产品埋点、通知和真实上线控制；事件列表最多显示最近80条但计算使用全部记录。实验协议修订只提供API且仅限无事件时。原始事件采用追加留痕，不提供覆盖删除；归档释放在线明细是唯一例外，且必须先通过回读核验并保留批次文件。归档文件与在线库同处 `artifacts` 命名卷，单机演示不做异地副本。前端字体网络不可用时退回字体类别。这里的显著结果仅是固定样本的大样本近似，不替代业务成本审查。
 
 MIT License，见LICENSE。真实验收、测试脚本、截图位于源码目录外 `../../test-artifacts/gb-3104/`。

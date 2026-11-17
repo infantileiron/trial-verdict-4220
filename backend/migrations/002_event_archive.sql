@@ -1,0 +1,9 @@
+-- 002_event_archive.sql
+-- 事件归档批次由 SQLAlchemy metadata（src/models/entities.py ArchiveBatch）建表：
+--   archive_batches(experiment_id, state, watermark, ids, source_count, event_count,
+--                   counts, checksum, path, attempts, error, created_by, created_at,
+--                   started_at, finished_at)
+-- 状态机：queued -> migrating -> done | failed；failed 可原地恢复重试。
+-- 归档文件是权威副本，写入采用临时文件+rename 原子替换，路径由 ARCHIVE_DIR 决定。
+-- 释放仅在归档回读核验（SHA256、事件数、分组计数、重复、实验归属）全部通过后，
+-- 与状态 done 在同一事务提交；失败自动回滚，在线原件完整保留。

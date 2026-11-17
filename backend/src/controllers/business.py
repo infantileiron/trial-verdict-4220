@@ -3,6 +3,7 @@ from datetime import datetime,timezone
 from src.models.entities import Experiment,Event,Decision
 from src.services.business import dump,utc
 from src.services.analysis import calculate
+from src.services.archive import ArchiveError,merged_events,prior_events
 def experiment(s,i):
  r=s.get(Experiment,i)
  if not r:raise HTTPException(404,'实验不存在')
@@ -15,16 +16,20 @@ def validate_event(s,data):
  exp=experiment(s,data.experiment_id);stamp=utc(data.occurred_at)
  if not (exp.starts_at<=stamp<=exp.ends_at):raise HTTPException(422,'事件时间必须落在实验预定区间内')
  if data.occurred_at>datetime.now(timezone.utc):raise HTTPException(422,'不能录入未来事件')
- prior=s.query(Event).filter_by(experiment_id=exp.id,user_key=data.user_key).all()
- if any(e.group!=data.group for e in prior):raise HTTPException(409,'同一用户不能跨组，需排查分流污染')
- if any(e.kind==data.kind for e in prior):raise HTTPException(409,'重复事件：同一实验/用户/事件类型只记一次')
+ try:prior=prior_events(s,exp.id,data.user_key)
+ except ArchiveError as e:raise HTTPException(409,f'归档不可读，暂不能校验该用户事件：{e}')
+ if any(e['group']!=data.group for e in prior):raise HTTPException(409,'同一用户不能跨组，需排查分流污染')
+ if any(e['kind']==data.kind for e in prior):raise HTTPException(409,'重复事件：同一实验/用户/事件类型只记一次')
  if data.kind=='activation':
-  exposure=next((e for e in prior if e.kind=='exposure'),None)
+  exposure=next((e for e in prior if e['kind']=='exposure'),None)
   if not exposure:raise HTTPException(422,'先录入该用户曝光，再录入激活')
-  if stamp<exposure.occurred_at:raise HTTPException(422,'激活时间不能早于曝光')
+  if stamp<exposure['occurred_at']:raise HTTPException(422,'激活时间不能早于曝光')
  return stamp
 def snapshot(s,exp):
- return {'experiment':dump(exp),'events':[dump(e) for e in s.query(Event).filter_by(experiment_id=exp.id).order_by(Event.id).all()]}
+ try:events=merged_events(s,exp.id)
+ except ArchiveError as e:raise HTTPException(409,f'归档不可读，拒绝冻结样本：{e}')
+ online=s.query(Event).filter_by(experiment_id=exp.id).count()
+ return {'experiment':dump(exp),'events':events,'sources':{'online':online,'archived':len(events)-online}}
 def publish(s,item,action,user):
  if item.state!='done':raise HTTPException(409,'计算完成后才可发布')
  if item.published_at:raise HTTPException(409,'该裁决已发布，记录不可覆盖')
